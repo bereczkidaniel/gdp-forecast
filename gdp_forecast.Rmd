@@ -1,0 +1,859 @@
+---
+title: "Forecasting Belgian GDP"
+author: "Daniel Bereczki"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.path = file.path(tempdir(), "fig-"), dev = "png", dpi = 110)
+```
+
+```{r packages, include=FALSE}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tseries)
+library(aTSA)
+library(forecast)
+library(TSA)
+library(astsa)
+library(lmtest)
+library(urca)
+library(vars)
+library(tsDyn)
+
+gdp <- read_xlsx("gdp_quarterly.xlsx")
+```
+
+The goal of this project is to model quarterly Belgian GDP and forecast it over a validation period (2023–2024), first without and then with exogenous variables (the GDP of Germany, France, and the Netherlands). The best model is then refit on the full sample to forecast 2025–2027.
+
+
+# Modeling without exogenous variables
+
+```{r gdp-raw, fig.path = "figures/"}
+ggplot(gdp[1:112, ], aes(x = Date_BE)) +
+  geom_line(aes(y = GDP_BE), linewidth = 0.7) +
+  labs(title = "Belgian GDP, 1995 Q1 – 2022 Q4",
+       x = "Date",
+       y = "Belgian GDP",
+       caption = "Source: https://fred.stlouisfed.org")
+```
+
+The series is not even weakly stationary: neither its mean nor its variance is constant over time. Three features stand out:\
+1. The series has a trend: GDP follows a clear long-run upward path.\
+2. The sawtooth pattern suggests seasonality. It is most visible between 2010 and 2020, and fits quarterly data: each year has two peaks and two troughs.\
+3. The size of the swings changes over time, so the variance is not constant. The amplitude differs clearly before and after 2010. There are fewer observations after 2020, but that period also shows larger swings than before.
+
+All of this suggests that the series needs to be decomposed before modeling.
+
+To learn more about the series, I plotted the correlograms.
+
+```{r acf-raw}
+acf(gdp$GDP_BE[1:112], main = "ACF of Belgian GDP")
+```
+
+The ACF decays slowly and is still outside the confidence band at lag 20.
+
+```{r pacf-raw}
+pacf(gdp$GDP_BE[1:112], main = "PACF of Belgian GDP")
+```
+
+The partial autocorrelations stay outside the confidence band up to lag 5. After that, apart from lag 13, the lags are no longer statistically significant.
+
+The slowly decaying, long-significant ACF confirms that the series has a trend, as the plot already suggested. The PACF decays relatively quickly and, by eye, drops off at about lag 2, although it stays significant up to lag 5. This relatively fast decay points to an autoregressive (AR) process, but it is not clear how many lags matter.
+
+```{r adf-raw}
+adf.test(gdp$GDP_BE[1:112])
+```
+```{r kpss-raw}
+kpss.test(gdp$GDP_BE[1:112])
+```
+
+Besides the correlograms, the unit root tests also indicate that the process is not stationary.
+
+Next, I removed the trend with a linear regression and handled the seasonal effects with seasonal indices.
+
+```{r ts-full, include=FALSE}
+be_ts <- ts(gdp[, 2], start = c(1995, 1), end = c(2022, 4), frequency = 4)
+be_test_ts <- ts(gdp[, 2], start = c(2023, 1), end = c(2024, 4), frequency = 4)
+```
+
+```{r trend-full, include=FALSE}
+n <- length(be_ts)
+t_idx <- 1:n
+fit_trend <- lm(be_ts ~ t_idx)
+summary(fit_trend)
+
+trend_fit <- ts(fitted(fit_trend), start = c(1995, 1), end = c(2022, 4), frequency = 4)
+
+plot(be_ts)
+lines(trend_fit)
+```
+
+```{r resid-full, include=FALSE}
+resids <- be_ts - fitted(fit_trend)
+plot(resids)
+```
+
+```{r seasonal-full, include=FALSE}
+# Seasonal index of each quarter, averaged over the first three years of the sample
+seasonal_wave <- sapply(1:4, function(i) mean(resids[c(i, i + 4, i + 8)]))
+sum(seasonal_wave)   # no further correction is needed if the sum is 0
+seasonal_index <- seasonal_wave
+resid_final <- resids - seasonal_index
+```
+
+```{r resid-final-full}
+plot(resid_final, main = "Series since 1995 after removing trend and seasonality")
+```
+
+Even after removing the trend and seasonality, the resulting process does not look stationary. The residual plot shows that until about 2008–2009 the seasonality is hard or impossible to see, but a trend component seems to remain. After 2008–2009 the opposite happens: the sawtooth pattern typical of seasonality remains, while the trend disappears or becomes much harder to see.
+The timing of this structural change is probably not a coincidence. For a GDP series it is not surprising that the 2008 crisis changed the dynamics of the process to some extent.
+For this reason, it makes sense to drop the beginning of the series and analyze it from 2009 Q1 onward.
+
+```{r ts-2009, include=FALSE}
+gdp <- read_xlsx("gdp_quarterly.xlsx")
+gdp <- gdp[57:nrow(gdp), ]
+
+be_ts <- ts(gdp[, 2], start = c(2009, 1), end = c(2022, 4), frequency = 4)
+be_test_ts <- ts(gdp[length(be_ts) + 1:length(gdp$GDP_BE), 2], start = c(2023, 1), end = c(2024, 4), frequency = 4)
+```
+
+```{r gdp-2009, include=FALSE}
+ggplot(gdp[1:64, ], aes(x = Date_BE)) +
+  geom_line(aes(y = GDP_BE), linewidth = 0.7) +
+  labs(title = "Belgian GDP, 2009 Q1 – 2022 Q4",
+       x = "Date",
+       y = "Belgian GDP",
+       caption = "Source: https://fred.stlouisfed.org")
+```
+
+As before, I removed the trend with a linear regression and the seasonal effect with seasonal indices, this time on the log of GDP.
+
+```{r trend-2009, include=FALSE}
+n <- length(be_ts)
+t_idx <- 1:n
+be_ts <- log(be_ts)
+fit_trend <- lm(be_ts ~ t_idx)
+summary(fit_trend)
+
+trend_fit <- ts(fitted(fit_trend), start = c(2009, 1), end = c(2022, 4), frequency = 4)
+```
+
+```{r trend-2009-plot}
+plot(be_ts, main = "Trend fitted to the period since 2009 (log GDP)")
+lines(trend_fit)
+```
+
+```{r resid-2009, include=FALSE}
+resids <- be_ts - fitted(fit_trend)
+plot(resids)
+```
+
+```{r seasonal-2009, include=FALSE}
+seasonal_wave <- sapply(1:4, function(i) mean(resids[c(i, i + 4, i + 8)]))
+sum(seasonal_wave)
+seasonal_index <- seasonal_wave
+resid_final <- resids - seasonal_index
+```
+```{r resid-final-2009}
+plot(resid_final, main = "Series since 2009 after removing trend and seasonality")
+```
+
+The next modeling problem is how to handle the effect of COVID. This requires an assumption, and there are two reasonable choices:\
+1. The observations during COVID are heavily distorted and can be treated as outliers (removed or replaced). This assumes that the long-run dynamics of the series do not change.\
+2. COVID is a new structural break in the series, similar to the 2008 crisis, after which the variance of the series appears to have changed permanently. This assumes that the long-run behavior of the series changes.
+
+I use the first assumption, but both can be defended and challenged, from a time series as well as an economic point of view. I chose to treat the COVID quarters as outliers because from around 2022 the series seems to follow the same trend as before 2020, with seasonal swings of the same size. This was not the case in the years after 2008–2009, when the strength of the seasonal effects did not return to its pre-2008 level.
+
+Instead of deleting the outliers, I replace each one with the average value of its quarter.
+
+```{r outlier-function}
+replace_outliers_with_seasonal_avg <- function(ts_data, outlier_periods) {
+  if (!inherits(ts_data, "ts")) stop("not a ts object")
+  if (frequency(ts_data) != 4) stop("the function assumes quarterly seasonality")
+
+  # Convert to a data frame
+  df <- data.frame(
+    year = floor(time(ts_data)),
+    quarter = cycle(ts_data),
+    value = as.numeric(ts_data)
+  )
+
+  # Flag the outliers
+  df$outlier <- apply(df, 1, function(row) {
+    any(sapply(outlier_periods, function(p) p[1] == row["year"] && p[2] == row["quarter"]))
+  })
+
+  # Quarterly averages, computed from the non-outlier observations only
+  quarter_means <- aggregate(value ~ quarter, data = df[!df$outlier, ], FUN = mean)
+
+  # Replace the outliers
+  for (i in which(df$outlier)) {
+    qtr <- df$quarter[i]
+    df$value[i] <- quarter_means$value[quarter_means$quarter == qtr]
+  }
+
+  # Convert back to a ts object
+  ts(df$value, start = start(ts_data), frequency = 4)
+}
+```
+
+```{r outliers-be, include=FALSE}
+# COVID quarters treated as outliers for Belgium
+outliers_be <- list(
+  c(2020, 2),
+  c(2020, 3),
+  c(2020, 4),
+  c(2021, 1)
+)
+
+cleaned_ts <- replace_outliers_with_seasonal_avg(resids, outliers_be)
+```
+
+After handling the outliers, the series from two plots earlier changes visibly:
+
+```{r cleaned-plot}
+plot(resids, col = "red", main = "Original and cleaned series")
+lines(cleaned_ts, col = "blue")
+legend("topleft", legend = c("Original", "Cleaned"), col = c("red", "blue"), lty = 1)
+```
+
+Since cleaning the data may have changed the trend of the original series, I add the originally estimated trend back to the cleaned series and fit a new regression.
+
+```{r trend-cleaned, include=FALSE}
+cleaned_ts <- cleaned_ts + fitted(fit_trend)
+fit_trend_cleaned <- lm(cleaned_ts ~ t_idx)
+summary(fit_trend_cleaned)
+
+trend_fit_cleaned <- ts(fitted(fit_trend_cleaned), start = c(2009, 1), end = c(2022, 4), frequency = 4)
+```
+
+```{r trend-change-plot}
+plot(be_ts, col = "blue", main = "Change in the trend after data cleaning")
+lines(cleaned_ts, col = "red")
+lines(trend_fit_cleaned, col = "red")
+lines(trend_fit, col = "blue")
+legend("topleft", legend = c("Original", "Cleaned"), col = c("blue", "red"), lty = 1)
+```
+
+```{r detrend-cleaned, include=FALSE}
+cleaned_ts_detrended <- cleaned_ts - fitted(fit_trend_cleaned)
+```
+
+```{r seasonal-cleaned, include=FALSE}
+seasonal_wave <- sapply(1:4, function(i) mean(cleaned_ts_detrended[c(i, i + 4, i + 8)]))
+sum(seasonal_wave)
+seasonal_index <- seasonal_wave
+resid_final <- cleaned_ts_detrended - seasonal_index
+```
+```{r resid-final-cleaned}
+plot(resid_final, main = "Outlier-cleaned series after removing seasonality")
+```
+
+The effect of COVID has visibly disappeared from the series, but some seasonal effect seems to remain around 2016. It is worth checking the correlograms to see whether these residuals can be considered white noise:
+
+```{r acf-manual}
+acf(resid_final, main = "ACF of the manually filtered residuals")
+```
+
+```{r pacf-manual}
+pacf(resid_final, main = "PACF of the manually filtered residuals")
+```
+
+This is not a convincing result. The ACF stays outside the confidence band for four lags and the PACF for three, and both usually change sign, so the seasonal filtering was not very successful. It is worth checking whether another method does better. The built-in `stl` function estimates the trend with LOESS smoothing, that is, by fitting local regressions, so it may capture the seasonality better as well.
+
+```{r stl, fig.path = "figures/"}
+decomp <- stl(cleaned_ts, s.window = "periodic")
+plot(decomp, main = "STL decomposition of log Belgian GDP (outliers cleaned)")
+```
+
+The trend panel of the decomposition shows that, unlike in the regression approach, the trend is not linear, so the seasonal component no longer contains the slight wave that remained with the previous method.
+
+```{r noise-compare}
+stl_noise <- decomp$time.series[, 3]
+plot(stl_noise, col = "blue", main = "Manually filtered vs. STL remainder")
+lines(resid_final, col = "red")
+legend("topleft", legend = c("STL", "Manual"), col = c("blue", "red"), lty = 1)
+```
+
+The plot does not show the manual remainder over every interval, but it makes clear how much more closely the STL remainder stays around zero.
+
+ADF test on the manually filtered remainder:
+```{r adf-manual}
+adf.test(resid_final)
+```
+ADF test on the STL remainder:
+```{r adf-stl}
+adf.test(stl_noise)
+```
+
+Based on the ADF test, the remainder from the LOESS-based decomposition is more convincing, so I continue the analysis with the STL decomposition.
+
+```{r acf-stl}
+acf(stl_noise, main = "ACF of the STL remainder")
+```
+
+```{r pacf-stl}
+pacf(stl_noise, main = "PACF of the STL remainder")
+```
+
+```{r arma-selection, include=FALSE}
+ARMA22 <- arima(stl_noise, c(2, 0, 2))
+coeftest(ARMA22) # no
+ARMA12 <- arima(stl_noise, c(1, 0, 2))
+coeftest(ARMA12) # no
+ARMA02 <- arima(stl_noise, c(0, 0, 2))
+coeftest(ARMA02) # maybe
+
+ARMA21 <- arima(stl_noise, c(2, 0, 1))
+coeftest(ARMA21) # no
+ARMA20 <- arima(stl_noise, c(2, 0, 0))
+coeftest(ARMA20) # maybe
+
+ARMA11 <- arima(stl_noise, c(1, 0, 1))
+coeftest(ARMA11) # maybe
+ARMA10 <- arima(stl_noise, c(1, 0, 0))
+coeftest(ARMA10) # no
+ARMA01 <- arima(stl_noise, c(0, 0, 1))
+coeftest(ARMA01) # maybe
+
+AIC(ARMA02) # best
+AIC(ARMA20)
+AIC(ARMA11)
+AIC(ARMA01)
+
+BIC(ARMA02) # best
+BIC(ARMA20)
+BIC(ARMA11)
+BIC(ARMA01)
+
+auto.arima(stl_noise)
+```
+The PACF no longer shows seasonal fluctuation, but both the ACF and the PACF have a spike at lag 2, so at most an ARMA(2,2) model is worth fitting. `auto.arima` suggests the empty model, while both the AIC and BIC information criteria select ARMA(0,2).
+
+```{r acf-arma02}
+acf(ARMA02$residuals, main = "ACF of the ARMA(0,2) residuals")
+```
+```{r pacf-arma02}
+pacf(ARMA02$residuals, main = "PACF of the ARMA(0,2) residuals")
+```
+
+The Ljung–Box test, plotted:
+
+```{r tsdiag}
+tsdiag(ARMA02) # high Ljung-Box p-values -> good
+```
+```{r ljung-box}
+Box.test(ARMA02$res, type = c("Ljung-Box"), lag = 20) # high p -> white noise
+```
+
+The McLeod–Li test, plotted:
+
+```{r mcleod-li}
+McLeod.Li.test(ARMA02) # Ljung-Box test on the squared residuals; high p -> no ARCH/GARCH effects
+```
+
+The high p-value of the Ljung–Box test means we cannot reject the null hypothesis, so the residuals behave like white noise. The McLeod–Li test, the Ljung–Box test applied to the squared residuals, tests for conditional heteroskedasticity. Its p-values are also high, so we cannot reject the null hypothesis, and the series shows no ARCH/GARCH effects.
+
+Since the model passed the diagnostic checks, it can be used to forecast the validation period and evaluate the result:
+
+```{r forecast-v1, include=FALSE}
+# remainder
+arma_model <- arima(stl_noise, c(0, 0, 2))
+noise_forecast <- predict(arma_model, n.ahead = 8)$pred
+noise_forecast
+
+# trend
+plot(decomp$time.series[, 2])
+length(decomp$time.series[, 2])
+trend_df <- as.data.frame(decomp$time.series[, 2])
+n2 <- length(trend_df$x)
+t_idx2 <- 1:n2
+trend_lm <- lm(trend_df$x ~ t_idx2)
+trend_lm$fitted.values
+newdata <- data.frame(t_idx2 = c(57:64))
+trend_forecast <- predict(trend_lm, newdata = newdata)
+
+# seasonality
+season_forecast <- rep(tail(decomp$time.series[, "seasonal"], frequency(cleaned_ts)), length.out = 8)
+
+# convert to ts objects
+trend_forecast <- ts(trend_forecast, start = c(2023, 1), end = c(2024, 4), frequency = 4)
+season_forecast <- ts(season_forecast, start = c(2023, 1), end = c(2024, 4), frequency = 4)
+
+# add up the forecast components
+total_forecast <- noise_forecast + trend_forecast + season_forecast
+
+# transform the forecast and the original series back from logs
+total_forecast <- exp(total_forecast)
+be_ts <- exp(be_ts)
+```
+
+```{r combine-v1, include=FALSE}
+ts_with_forecast <- ts(c(be_ts, total_forecast), start = start(be_ts), frequency = frequency(be_ts))
+
+ts_actual <- ts(c(be_ts, be_test_ts), start = start(be_ts), frequency = frequency(be_ts))
+```
+```{r forecast-v1-plot}
+plot(ts_actual, col = "red", xlab = "Year", ylab = "GDP",
+     main = "Actual and forecast GDP (linear trend forecast)")
+lines(total_forecast, col = "blue", lwd = 2)
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+```
+
+```{r smape-v1, include=FALSE}
+# Evaluate the validation forecast with SMAPE
+smape_fn <- function(x, y) mean(abs(x - y) / ((abs(x) + abs(y)) / 2))
+smape_v1 <- smape_fn(total_forecast, be_test_ts)
+smape_v1
+```
+
+The forecast plot and the SMAPE value (`r round(smape_v1, 5)`) show that the model performs reasonably well, but it underestimates the second and third quarters. Part of the reason may be that the STL decomposition estimated the trend with LOESS, while I forecast the trend with an ordinary linear regression. It is worth forecasting the trend with the built-in `forecast()` function instead, which for a ts object uses exponential smoothing by default (source: https://www.rdocumentation.org/packages/forecast/versions/8.23.0/topics/forecast.ts: "If model=NULL, the function forecast.ts makes forecasts using ets models", where an ets model is an exponential smoothing state space model).
+
+```{r forecast-v2, include=FALSE}
+trend_forecast_v2 <- forecast(decomp$time.series[, 2], h = 8)
+trend_forecast_v2 <- ts(trend_forecast_v2$mean, start = c(2023, 1), end = c(2024, 4), frequency = 4)
+
+# add up the forecast components
+total_forecast_v2 <- noise_forecast + trend_forecast_v2 + season_forecast
+
+# transform the forecast back from logs
+total_forecast_v2 <- exp(total_forecast_v2)
+
+ts_v2 <- ts(c(be_ts, total_forecast_v2), start = start(be_ts), frequency = frequency(be_ts))
+```
+
+```{r forecast-v2-plot, fig.path = "figures/"}
+plot(ts_actual, col = "red", xlab = "Year", ylab = "GDP",
+     main = "Validation 2023-2024: actual and forecast GDP")
+lines(total_forecast_v2, col = "blue", lwd = 2)
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+```
+
+```{r smape-v2, include=FALSE}
+smape_no_exog <- smape_fn(total_forecast_v2, be_test_ts)
+smape_no_exog
+```
+
+Both the plot and the SMAPE (`r round(smape_no_exog, 6)`) show that the forecast improved over the validation period.
+
+
+# Modeling with exogenous variables
+
+```{r data-exog, include=FALSE}
+gdp <- read_xlsx("gdp_quarterly.xlsx")
+gdp_be <- gdp[57:120, 1:2]
+gdp_de <- gdp[73:136, 3:4]
+gdp_fr <- gdp[117:180, 5:6]
+gdp_nl <- gdp[57:120, 7:8]
+
+de_ts <- ts(gdp_de[, 2], start = c(2009, 1), end = c(2022, 4), frequency = 4)
+de_test_ts <- ts(gdp_de[, 2], start = c(2023, 1), end = c(2024, 4), frequency = 4)
+de_test_ts
+
+fr_ts <- ts(gdp_fr[, 2], start = c(2009, 1), end = c(2022, 4), frequency = 4)
+fr_test_ts <- ts(gdp_fr[, 2], start = c(2023, 1), end = c(2024, 4), frequency = 4)
+fr_ts
+
+nl_ts <- ts(gdp_nl[, 2], start = c(2009, 1), end = c(2022, 4), frequency = 4)
+nl_test_ts <- ts(gdp_nl[, 2], start = c(2023, 1), end = c(2024, 4), frequency = 4)
+nl_ts
+
+cor(de_ts, be_ts)
+cor(fr_ts, be_ts)
+cor(nl_ts, be_ts)
+```
+
+```{r data-long, include=FALSE}
+# Cut to the common window, combine, and use consistent names
+df_be <- data.frame(Date = gdp_be$Date_BE[1:56], GDP = gdp_be$GDP_BE[1:56], Country = "Belgium")
+df_de <- data.frame(Date = gdp_be$Date_BE[1:56], GDP = gdp_de$GDP_DE[1:56], Country = "Germany")
+df_fr <- data.frame(Date = gdp_be$Date_BE[1:56], GDP = gdp_fr$GDP_FR[1:56], Country = "France")
+df_nl <- data.frame(Date = gdp_be$Date_BE[1:56], GDP = gdp_nl$GDP_NL[1:56], Country = "Netherlands")
+
+# Long and wide formats
+df_long <- bind_rows(df_be, df_de, df_fr, df_nl)
+df_wide <- cbind(df_be, df_de, df_fr, df_nl)
+colnames(df_wide) <- c("Date", "GDP_BE", "Country", "Date", "GDP_DE", "Country",
+                       "Date", "GDP_FR", "Country", "Date", "GDP_NL", "Country")
+df_wide <- df_wide[, c(1, 2, 5, 8, 11)]
+```
+```{r gdp-four-countries, fig.path = "figures/"}
+ggplot(df_long, aes(x = Date, y = GDP, color = Country)) +
+  geom_line(linewidth = 0.8) +
+  labs(title = "GDP of the four countries, 2009 Q1 – 2022 Q4",
+       x = "Date",
+       y = "GDP",
+       caption = "Source: https://fred.stlouisfed.org") +
+  theme_minimal()
+```
+
+To decide which series to use as an exogenous variable for forecasting Belgian GDP, it is worth testing for Granger causality between the series, that is, whether German, French, or Dutch GDP Granger-causes Belgian GDP.
+
+First, I checked whether the GDP series are cointegrated, that is, whether they share a common long-run path. The Johansen test indicates 2 cointegrating vectors. Running the Granger causality test also requires choosing the number of lags, for which I used the `VARselect` function. This requires stationary series, so I repeated the steps above for the German, French, and Dutch series as well. Based on `VARselect`, I set the lag order to 4, giving equal weight to the information criteria (AIC: 6, HQ: 2, SC: 2, FPE: 6).
+
+```{r johansen, include=FALSE}
+johansen <- ca.jo(df_wide[, 2:5], type = "eigen", K = 2, ecdet = "const", spec = "longrun")
+summary(johansen)
+# 2 cointegrating vectors
+```
+
+```{r decomp-de, include=FALSE}
+# COVID quarters treated as outliers for Germany (same window as Belgium)
+outliers_de <- outliers_be
+
+n <- length(de_ts)
+t_idx <- 1:n
+de_ts <- log(de_ts)
+fit_trend <- lm(de_ts ~ t_idx)
+summary(fit_trend)
+trend_fit <- ts(fitted(fit_trend), start = c(2009, 1), end = c(2022, 4), frequency = 4)
+resids <- de_ts - fitted(fit_trend)
+plot(resids)
+
+cleaned_ts <- replace_outliers_with_seasonal_avg(resids, outliers_de)
+
+decomp_de <- stl(cleaned_ts, s.window = "periodic")
+plot(decomp_de)
+```
+
+```{r decomp-fr, include=FALSE}
+# COVID quarters treated as outliers for France
+outliers_fr <- list(
+  c(2020, 1),
+  c(2020, 2),
+  c(2020, 3),
+  c(2020, 4),
+  c(2021, 1),
+  c(2021, 2),
+  c(2021, 3)
+)
+
+n <- length(fr_ts)
+t_idx <- 1:n
+fr_ts <- log(fr_ts)
+fit_trend <- lm(fr_ts ~ t_idx)
+summary(fit_trend)
+trend_fit <- ts(fitted(fit_trend), start = c(2009, 1), end = c(2022, 4), frequency = 4)
+resids <- fr_ts - fitted(fit_trend)
+plot(resids)
+
+plot(fr_ts)
+cleaned_ts <- replace_outliers_with_seasonal_avg(resids, outliers_fr)
+plot(cleaned_ts)
+
+decomp_fr <- stl(cleaned_ts, s.window = "periodic")
+plot(decomp_fr)
+```
+
+```{r decomp-nl, include=FALSE}
+plot(nl_ts)
+
+# COVID quarters treated as outliers for the Netherlands
+outliers_nl <- list(
+  c(2020, 1),
+  c(2020, 2),
+  c(2020, 3),
+  c(2020, 4),
+  c(2021, 1),
+  c(2021, 2),
+  c(2021, 3)
+)
+
+n <- length(nl_ts)
+t_idx <- 1:n
+nl_ts <- log(nl_ts)
+fit_trend <- lm(nl_ts ~ t_idx)
+summary(fit_trend)
+trend_fit <- ts(fitted(fit_trend), start = c(2009, 1), end = c(2022, 4), frequency = 4)
+resids <- nl_ts - fitted(fit_trend)
+plot(resids)
+
+cleaned_ts <- replace_outliers_with_seasonal_avg(resids, outliers_nl)
+plot(cleaned_ts)
+
+decomp_nl <- stl(cleaned_ts, s.window = "periodic")
+plot(decomp_nl)
+```
+
+```{r varselect, include=FALSE}
+remainders <- data.frame(
+  belgium = stl_noise,
+  germany = decomp_de$time.series[, 3],
+  france = decomp_fr$time.series[, 3],
+  netherlands = decomp_nl$time.series[, 3]
+)
+VARselect(remainders, lag.max = 6)
+```
+
+```{r vecm, include=FALSE}
+vecm <- VECM(df_wide[, 2:5], lag = 4, r = 2)
+summary(vecm)
+```
+
+```{r vecm-diagnostics, include=FALSE}
+vec2var_model <- tsDyn:::vec2var.tsDyn(vecm)
+class(vec2var_model)
+
+serial.test(vec2var_model)    # passes
+arch.test(vec2var_model)      # passes
+normality.test(vec2var_model) # residuals not normal
+```
+```{r granger-de, include=FALSE}
+granger_de <- causality(VAR(df_wide[, c("GDP_DE", "GDP_BE")], lag = 4, type = "const"), cause = "GDP_DE")
+granger_de
+# H0: beta = 0
+# H0 is rejected, so GDP_DE Granger-causes GDP_BE
+```
+```{r granger-fr, include=FALSE}
+granger_fr <- causality(VAR(df_wide[, c("GDP_FR", "GDP_BE")], lag = 4, type = "const"), cause = "GDP_FR")
+granger_fr
+# H0: beta = 0
+# H0 is rejected, so GDP_FR Granger-causes GDP_BE
+```
+```{r granger-nl, include=FALSE}
+granger_nl <- causality(VAR(df_wide[, c("GDP_NL", "GDP_BE")], lag = 4, type = "const"), cause = "GDP_NL")
+granger_nl
+# H0: beta = 0
+# H0 is rejected, so GDP_NL Granger-causes GDP_BE
+```
+
+Since the GDP of all three other countries turned out to Granger-cause Belgian GDP, each of them goes through the same steps as the Belgian series: removing the trend and seasonality, fitting a suitable model to the remainder, and forecasting the remainder with that model. The remainder of each country can then be added separately as an exogenous variable to the Belgian forecast, and SMAPE decides which country's data helps most.
+
+```{r exog-de, include=FALSE}
+# Germany
+
+arma_model_de <- arima(stl_noise, c(0, 0, 2), xreg = decomp_de$time.series[, "remainder"])
+tsdiag(arma_model_de)
+adf.test(arma_model_de$residuals)
+acf(arma_model_de$residuals)
+pacf(arma_model_de$residuals)
+
+acf(decomp_de$time.series[, "remainder"])
+pacf(decomp_de$time.series[, "remainder"])
+de_ARMA22 <- arima(decomp_de$time.series[, "remainder"], c(2, 0, 2))
+coeftest(de_ARMA22)
+de_ARMA20 <- arima(decomp_de$time.series[, "remainder"], c(2, 0, 0))
+coeftest(de_ARMA20)
+de_ARMA01 <- arima(decomp_de$time.series[, "remainder"], c(0, 0, 1))
+coeftest(de_ARMA01)
+AIC(de_ARMA22)
+AIC(de_ARMA20)
+AIC(de_ARMA01)
+BIC(de_ARMA22)
+BIC(de_ARMA20)
+BIC(de_ARMA01)
+acf(de_ARMA01$residuals)
+pacf(de_ARMA01$residuals)
+tsdiag(de_ARMA01)
+de_noise_forecast <- predict(de_ARMA01, n.ahead = 8)$pred
+de_noise_forecast
+
+noise_de <- predict(arma_model_de, n.ahead = 8, newxreg = de_noise_forecast)$pred
+noise_de
+
+# add up the forecast components
+forecast_de <- noise_de + trend_forecast_v2 + season_forecast
+forecast_de
+# transform the forecast back from logs
+forecast_de <- exp(forecast_de)
+
+ts_de <- ts(c(be_ts, forecast_de), start = start(be_ts), frequency = frequency(be_ts))
+
+plot(ts_actual, col = "red", main = "Actual and forecast GDP")
+lines(ts_de, col = "blue")
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+
+smape_de <- smape_fn(forecast_de, be_test_ts)
+smape_de
+```
+
+```{r exog-fr, include=FALSE}
+# France
+
+arma_model_fr <- arima(stl_noise, c(0, 0, 2), xreg = decomp_fr$time.series[, "remainder"])
+tsdiag(arma_model_fr)
+adf.test(arma_model_fr$residuals)
+acf(arma_model_fr$residuals)
+pacf(arma_model_fr$residuals)
+
+acf(decomp_fr$time.series[, "remainder"])
+pacf(decomp_fr$time.series[, "remainder"])
+fr_ARMA22 <- arima(decomp_fr$time.series[, "remainder"], c(2, 0, 2))
+coeftest(fr_ARMA22) # no
+fr_ARMA20 <- arima(decomp_fr$time.series[, "remainder"], c(2, 0, 0))
+coeftest(fr_ARMA20) # possible
+fr_ARMA02 <- arima(decomp_fr$time.series[, "remainder"], c(0, 0, 2))
+coeftest(fr_ARMA02) # possible
+fr_ARMA21 <- arima(decomp_fr$time.series[, "remainder"], c(2, 0, 1))
+coeftest(fr_ARMA21) # no
+fr_ARMA12 <- arima(decomp_fr$time.series[, "remainder"], c(1, 0, 2))
+coeftest(fr_ARMA12) # no
+AIC(fr_ARMA20)
+AIC(fr_ARMA02) # better
+BIC(fr_ARMA20)
+BIC(fr_ARMA02) # better
+acf(fr_ARMA02$residuals)
+pacf(fr_ARMA02$residuals)
+tsdiag(fr_ARMA02)
+fr_noise_forecast <- predict(fr_ARMA02, n.ahead = 8)$pred
+fr_noise_forecast
+
+noise_fr <- predict(arma_model_fr, n.ahead = 8, newxreg = fr_noise_forecast)$pred
+noise_fr
+
+# add up the forecast components
+forecast_fr <- noise_fr + trend_forecast_v2 + season_forecast
+forecast_fr
+# transform the forecast back from logs
+forecast_fr <- exp(forecast_fr)
+
+ts_fr <- ts(c(be_ts, forecast_fr), start = start(be_ts), frequency = frequency(be_ts))
+
+plot(ts_actual, col = "red", main = "Actual and forecast GDP")
+lines(ts_fr, col = "blue")
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+
+smape_fr <- smape_fn(forecast_fr, be_test_ts)
+smape_fr
+
+# Germany is better so far
+```
+
+```{r exog-nl, include=FALSE}
+# Netherlands
+
+arma_model_nl <- arima(stl_noise, c(0, 0, 2), xreg = decomp_nl$time.series[, "remainder"])
+tsdiag(arma_model_nl)
+adf.test(arma_model_nl$residuals)
+acf(arma_model_nl$residuals)
+pacf(arma_model_nl$residuals)
+
+acf(decomp_nl$time.series[, "remainder"])
+pacf(decomp_nl$time.series[, "remainder"])
+nl_ARMA31 <- arima(decomp_nl$time.series[, "remainder"], c(3, 0, 1))
+coeftest(nl_ARMA31) # no
+nl_ARMA30 <- arima(decomp_nl$time.series[, "remainder"], c(3, 0, 0))
+coeftest(nl_ARMA30) # possible
+nl_ARMA02 <- arima(decomp_nl$time.series[, "remainder"], c(0, 0, 2))
+coeftest(nl_ARMA02) # no
+nl_ARMA01 <- arima(decomp_nl$time.series[, "remainder"], c(0, 0, 1))
+coeftest(nl_ARMA01) # possible
+
+AIC(nl_ARMA30)
+AIC(nl_ARMA01) # better
+BIC(nl_ARMA30)
+BIC(nl_ARMA01) # better
+acf(nl_ARMA01$residuals)
+pacf(nl_ARMA01$residuals)
+tsdiag(nl_ARMA01)
+adf.test(nl_ARMA01$residuals)
+acf(nl_ARMA30$residuals)
+pacf(nl_ARMA30$residuals)
+tsdiag(nl_ARMA30)
+adf.test(nl_ARMA30$residuals)
+
+# The information criteria slightly prefer ARMA(0,1), but the diagnostics favor
+# ARMA(3,0), so I use ARMA(3,0)
+
+nl_noise_forecast <- predict(nl_ARMA30, n.ahead = 8)$pred
+nl_noise_forecast
+
+noise_nl <- predict(arma_model_nl, n.ahead = 8, newxreg = nl_noise_forecast)$pred
+noise_nl
+
+# add up the forecast components
+forecast_nl <- noise_nl + trend_forecast_v2 + season_forecast
+forecast_nl
+# transform the forecast back from logs
+forecast_nl <- exp(forecast_nl)
+
+ts_nl <- ts(c(be_ts, forecast_nl), start = start(be_ts), frequency = frequency(be_ts))
+
+plot(ts_actual, col = "red", main = "Actual and forecast GDP")
+lines(ts_nl, col = "blue")
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+
+smape_nl <- smape_fn(forecast_nl, be_test_ts)
+smape_nl
+```
+
+SMAPE on the validation period (2023–2024) for each model:
+
+```{r smape-table}
+smape_table <- data.frame(
+  Model = c("No exogenous variable", "With German GDP", "With French GDP", "With Dutch GDP"),
+  SMAPE = c(smape_no_exog, smape_de, smape_fr, smape_nl)
+)
+knitr::kable(smape_table, digits = 6)
+```
+
+Among the models with an exogenous variable, the one using German data performs best, with a SMAPE of `r round(smape_de, 6)`. Despite this, it does not beat the model without an exogenous variable, whose SMAPE is `r round(smape_no_exog, 6)`.
+
+Based on these results, I use the model without exogenous variables to forecast 2025–2027:
+
+```{r final-forecast, include=FALSE}
+gdp <- read_xlsx("gdp_quarterly.xlsx")
+gdp <- gdp[57:nrow(gdp), ]
+
+be_ts <- ts(gdp[, 2], start = c(2009, 1), end = c(2024, 4), frequency = 4)
+be_ts <- log(be_ts)
+
+n <- length(be_ts)
+t_idx <- 1:n
+fit_trend <- lm(be_ts ~ t_idx)
+summary(fit_trend)
+resids <- be_ts - fitted(fit_trend)
+
+cleaned_ts <- replace_outliers_with_seasonal_avg(resids, outliers_be)
+cleaned_ts <- cleaned_ts + fitted(fit_trend)
+
+decomp <- stl(cleaned_ts, s.window = "periodic")
+stl_noise <- decomp$time.series[, 3]
+
+# remainder
+arma_model <- arima(stl_noise, c(0, 0, 2))
+noise_forecast <- predict(arma_model, n.ahead = 12)$pred
+noise_forecast
+
+# trend
+trend_forecast <- forecast(decomp$time.series[, 2], h = 12)
+trend_forecast <- ts(trend_forecast$mean, start = c(2025, 1), end = c(2027, 4), frequency = 4)
+
+# seasonality
+season_forecast <- rep(tail(decomp$time.series[, "seasonal"], frequency(cleaned_ts)), length.out = 12)
+# convert to a ts object
+season_forecast <- ts(season_forecast, start = c(2025, 1), end = c(2027, 4), frequency = 4)
+
+# add up the forecast components
+total_forecast <- noise_forecast + trend_forecast + season_forecast
+
+# transform the forecast and the original series back from logs
+total_forecast <- exp(total_forecast)
+be_ts <- exp(be_ts)
+```
+
+```{r final-combine, include=FALSE}
+ts_with_forecast <- ts(c(be_ts, total_forecast), start = start(be_ts), frequency = frequency(be_ts))
+```
+
+```{r final-forecast-plot, fig.path = "figures/"}
+plot(ts_with_forecast, type = "n", xlab = "Year", ylab = "GDP",
+     main = "Belgian GDP: actual 2009-2024 and forecast 2025-2027")
+lines(be_ts, col = "red")
+lines(total_forecast, col = "blue", lwd = 2)
+legend("topleft", legend = c("Actual", "Forecast"), col = c("red", "blue"), lty = 1)
+```
+
+```{r final-forecast-table}
+knitr::kable(
+  data.frame(Year = rep(2025:2027, each = 4),
+             Quarter = rep(paste0("Q", 1:4), 3),
+             `Forecast GDP` = round(as.numeric(total_forecast), 1),
+             check.names = FALSE),
+  caption = "Quarterly forecast of Belgian GDP"
+)
+```
